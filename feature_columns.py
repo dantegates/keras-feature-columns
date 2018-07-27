@@ -1,94 +1,164 @@
+import collections
+import functools
+import itertools
+
 import keras
 import numpy as np
 
 
-class FeatureColumn:
-    def __init__(self, name):
-        self.name = name
-        self.input = keras.layers.Input((1,), name=self.name)
-
-    @property
-    def output(self):
-        return self.input
-
-    def transform(self, X):
-        return X.values
-
-
-class NumericColumn(FeatureColumn):
-    def __init__(self, *args, normalizer=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.normalizer = normalizer
-
-    def fit(self, X):
-        if self.normalizer is not None:
-            self.normalizer.fit(X)
-        return self
-
-    def transform(self, X):
-        if self.normalizer is not None:
-            return self.normalizer.transform(X).values
-        return X.values
-    
-    
-class EmbeddingColumn(FeatureColumn):
-    def __init__(self, *args, vocab_size, output_dim, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.vocab_size = vocab_size
-        self.output_dim = output_dim
-
-    def fit(self, X):
-        self.vocab_map = {v: i for i, v in enumerate(set(X))}
-        @np.vectorize
-        def apply_mapping(X):
-            return self.vocab_map.get(x, self.vocab_size)
-        self._apply_mapping = apply_mapping
-        return self
-
-    def transform(self, X):
-        return self._apply_mapping(X)
-
-    @property
-    def output(self):
-        embedding = keras.layers.Embedding(
-            input_dim=self.vocab_size+1,  # +1 for OOV
-            output_dim=self.output_dim,
-            input_length=1)(self.input)
-        return keras.layers.Flatten()(embedding)
+def _cached_property(fn):
+    fn._cached_property = True
+    return property(functools.lru_cache(1)(fn))
 
 
 class FeatureSet:
+    """Feature preprocessor.
+
+    Instances of `FeatureSet` are used to define a set of features input to a
+    `keras` model.
+
+    Args:
+        *features (`Feature` instances): The `Feature` instances that define
+            a model's feature set.
+
+    Attributes:
+        inputs (`list`): List of keras Input layers.
+        outputs (`list`): keras tensor representing the concatenation of all
+            feature columns.
+    """
     def __init__(self, *features):
         self.features = features
 
     def fit(self, X):
+        """Fit all features."""
         self.features = [f.fit(X[f.name]) for f in self.features]
         return self
 
     def transform(self, X):
+        """Return transformed features."""
         return [f.transform(X[f.name]) for f in self.features]
 
     def fit_transform(self, X):
+        """Fit all features and return transformations."""
         return self.fit(X).transform(X)
 
-    @property
+    @_cached_property
     def inputs(self):
+        """The feature inputs."""
         return [f.input for f in self.features]
 
-    @property
+    @_cached_property
     def output(self):
+        """The feature outputs."""
         concat = keras.layers.Concatenate(axis=-1)
         return concat([f.output for f in self.features])
+    
+    @classmethod
+    def combine(cls, *feature_sets):
+        features = itertools.chain.from_iterable(fs.features for fs in feature_sets)
+        return cls(*list(features))
+
+    def __getitem__(self, name):
+        # inefficient - but self.features is probably small anyway. lazy first pass
+        feature = None
+        for f in self.features:
+            if f.name == name:
+                feature = f
+        return feature
 
 
-class Scaler:
-    def __init__(self):
-        self.mean = self.std = None
+class Feature:
+    _class_instances = collections.defaultdict(int)
 
+    def __init__(self, name, input_dim=1):
+        self.name = name
+        self.input = keras.layers.Input((input_dim,), name=self._uid)
+
+    @_cached_property
+    def output(self):
+        return self.input
+    
     def fit(self, X):
-        self.mean = np.mean(X)
-        self.std = np.std(X)
         return self
 
     def transform(self, X):
-        return (X - self.mean) / self.std
+        return getattr(X, 'values', X)  # pd.DataFrame friendly
+
+    @_cached_property
+    def _uid(self):
+        class_name = self.__class__.__name__
+        self._class_instances[class_name] += 1
+        return f'{self.name}_{self._class_instances[class_name]}'
+
+
+class NumericFeature(Feature):
+    def __init__(self, *args, normalizer=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.normalizer = normalizer
+
+    def transform(self, X):
+        if self.normalizer is not None:
+            return self.normalizer(X)
+        return super().transform(X)
+
+
+class Categories:
+    def __init__(self, categories):
+        self.indices = {v: i for i, v in enumerate(categories)}
+        self.map = np.vectorize(lambda x: self.indices.get(x, len(self.indices)))
+
+    def __len__(self):
+        return len(self.indices)
+    
+
+class CategoricalFeature(Feature):
+    def __init__(self, *args, X=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.categories = None
+        if X is not None:
+            self.fit(X)
+
+    def fit(self, X):
+        X = getattr(X, self.name, X)  # pandas.DataFrame friendly
+        if self.categories is None:
+            self.categories = Categories(set(X))
+        return self
+
+    def transform(self, X):
+        return self.categories.map(X)
+
+
+class OneHotFeature(CategoricalFeature, Feature):
+    def __init__(self, *args, input_dim=1, categories=None, **kwargs):
+        input_dim = len(categories) + 1 if categories is not None else input_dim
+        super().__init__(*args, categories=categories, input_dim=input_dim, **kwargs)
+
+    def fit(self, X):
+        super().fit(X)
+        return self
+
+    def transform(self, X):
+        one_hots = np.zeros((len(X), len(self.categories)+1))
+        one_hots[np.arange(len(X)), self.categories.map(X)] = 1
+        return one_hots
+
+    
+class EmbeddedFeature(CategoricalFeature, Feature):
+    def __init__(self, *args, embedding=None, embedding_dim=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if embedding is not None:
+            self.embedding = embedding
+            self.embedding_dim = embedding.output_dim
+        else:
+            if embedding_dim is None:
+                raise ValueError(
+                    'one of `embedding_dim` or `embedding` must be specified')
+            self.embedding_dim = embedding_dim
+            self.embedding = keras.layers.Embedding(
+                input_dim=len(self.categories)+1,  # +1 for OOV
+                output_dim=self.embedding_dim,
+                input_length=1)
+
+    @_cached_property
+    def output(self):
+        return keras.layers.Flatten()(self.embedding(self.input))
