@@ -12,44 +12,25 @@ def _cached_property(fn):
 
 
 class FeatureSet:
-    """Feature preprocessor.
-
-    Instances of `FeatureSet` are used to define a set of features input to a
-    `keras` model.
-
-    Args:
-        *features (`Feature` instances): The `Feature` instances that define
-            a model's feature set.
-
-    Attributes:
-        inputs (`list`): List of keras Input layers.
-        outputs (`list`): keras tensor representing the concatenation of all
-            feature columns.
-    """
     def __init__(self, *features):
         self.features = features
 
     def fit(self, X):
-        """Fit all features."""
         self.features = [f.fit(X[f.name]) for f in self.features]
         return self
 
     def transform(self, X):
-        """Return transformed features."""
         return [f.transform(X[f.name]) for f in self.features]
 
     def fit_transform(self, X):
-        """Fit all features and return transformations."""
         return self.fit(X).transform(X)
 
     @_cached_property
     def inputs(self):
-        """The feature inputs."""
         return [f.input for f in self.features]
 
     @_cached_property
     def output(self):
-        """The feature outputs."""
         concat = keras.layers.Concatenate(axis=-1)
         return concat([f.output for f in self.features])
     
@@ -129,9 +110,9 @@ class CategoricalFeature(Feature):
 
 
 class OneHotFeature(CategoricalFeature, Feature):
-    def __init__(self, *args, input_dim=1, categories=None, **kwargs):
-        input_dim = len(categories) + 1 if categories is not None else input_dim
-        super().__init__(*args, categories=categories, input_dim=input_dim, **kwargs)
+    def __init__(self, *args, input_dim=1, X=None, **kwargs):
+        input_dim = len(set(X)) + 1 if X is not None else input_dim
+        super().__init__(*args, X=X, input_dim=input_dim, **kwargs)
 
     def fit(self, X):
         super().fit(X)
@@ -144,20 +125,13 @@ class OneHotFeature(CategoricalFeature, Feature):
 
     
 class EmbeddedFeature(CategoricalFeature, Feature):
-    def __init__(self, *args, embedding=None, embedding_dim=None, **kwargs):
+    def __init__(self, *args, embedding_dim, **kwargs):
         super().__init__(*args, **kwargs)
-        if embedding is not None:
-            self.embedding = embedding
-            self.embedding_dim = embedding.output_dim
-        else:
-            if embedding_dim is None:
-                raise ValueError(
-                    'one of `embedding_dim` or `embedding` must be specified')
-            self.embedding_dim = embedding_dim
-            self.embedding = keras.layers.Embedding(
-                input_dim=len(self.categories)+1,  # +1 for OOV
-                output_dim=self.embedding_dim,
-                input_length=1)
+        self.embedding_dim = embedding_dim
+        self.embedding = keras.layers.Embedding(
+            input_dim=len(self.categories)+1,  # +1 for OOV
+            output_dim=self.embedding_dim,
+            input_length=1)
 
     @_cached_property
     def output(self):
